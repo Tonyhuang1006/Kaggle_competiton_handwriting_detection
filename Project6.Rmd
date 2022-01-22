@@ -1,0 +1,951 @@
+---
+title: "Project 6"
+author: "Yihua Huang"
+date: "12/3/2021"
+output: html_document
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(vip)
+library(parallel)
+library(doParallel)
+library(embed)
+library(textrecipes)
+library(stringr)
+library(solitude)
+library(DALEXtra)
+library(rpart)
+library(rpart.plot)
+```
+
+
+```{r, message=FALSE}
+loan <- read_csv("loan_train.csv") %>% clean_names()
+skim(loan)
+
+```
+
+
+```{r, message=FALSE}
+holdout <- read_csv("loan_holdout.csv") %>% clean_names()
+
+skim(holdout)
+```
+
+```{r}
+df <- loan %>%
+  mutate(issue_d = as.factor(substr(issue_d, 5, 8)), 
+         fico_avg = (fico_range_low + fico_range_high)/2, 
+         earliest_cr_line = as.factor(substr(earliest_cr_line, 5, 8)),
+         last_pymnt_d = as.factor(substr(last_pymnt_d, 5, 8)),
+         next_pymnt_d = as.factor(substr(next_pymnt_d, 5, 8)),
+         last_credit_pull_d = as.factor(substr(last_credit_pull_d, 5, 8)),
+         int_rate = as.numeric(substr(int_rate, 1, nchar(int_rate)-1)),
+         revol_util = as.numeric(substr(revol_util, 1, nchar(revol_util)-1)),
+         acc_now_delinq = factor(acc_now_delinq),
+         chargeoff_within_12_mths = factor(chargeoff_within_12_mths),
+         tax_liens = factor(tax_liens),
+         policy_code = factor(policy_code),
+         collections_12_mths_ex_med = factor(collections_12_mths_ex_med),
+         term = as.factor(substr(term, 1, 2))) %>%
+  mutate_if(is.character, factor)
+
+skim(df)
+```
+
+```{r}
+holdout <- holdout %>%
+  mutate(issue_d = as.factor(substr(issue_d, 5, 8)), 
+         fico_avg = (fico_range_low + fico_range_high)/2, 
+         earliest_cr_line = as.factor(substr(earliest_cr_line, 5, 8)),
+         last_pymnt_d = as.factor(substr(last_pymnt_d, 5, 8)),
+         next_pymnt_d = as.factor(substr(next_pymnt_d, 5, 8)),
+         last_credit_pull_d = as.factor(substr(last_credit_pull_d, 5, 8)),
+         int_rate = as.numeric(substr(int_rate, 1, nchar(int_rate)-1)),
+         revol_util = as.numeric(substr(revol_util, 1, nchar(revol_util)-1)),
+         acc_now_delinq = factor(acc_now_delinq),
+         chargeoff_within_12_mths = factor(chargeoff_within_12_mths),
+         tax_liens = factor(tax_liens),
+         policy_code = factor(policy_code),
+         collections_12_mths_ex_med = factor(collections_12_mths_ex_med),
+         term = as.factor(substr(term, 1, 2))) %>%
+  mutate_if(is.character, factor)
+
+skim(holdout)
+```
+## Part 1. Exploratory analysis
+
+# 1. Histograms for all numeric Variables
+
+```{r}
+num <- colnames(df %>% select_if(is.numeric))
+
+for (i in num){
+  p1<- df %>%
+    ggplot(aes(!!as.name(i),fill=factor(loan_status)))+
+    geom_boxplot() +
+    ggtitle(i) +
+    labs(fill = "Default")
+  show(p1)
+}
+```
+
+# 2. Count through all factor variables in the dataset
+
+```{r}
+char <- colnames(df %>% select_if(is.factor))
+
+for (k in char){
+  p2 <- df %>%
+    count(!!as.name(k), sort=TRUE) %>%
+    mutate(rate = n/sum(n)) 
+  show(p2)
+}
+```
+
+## 3. Discover corrletion between all numeric variables
+
+```{r}
+library(corrplot)
+
+loan_numeric <- df %>%
+  dplyr::select_if(is.numeric)%>%
+  mutate(across(is.numeric, replace_na,0)) %>%
+  cor()
+
+library(reshape2)
+loan_numeric %>%
+  melt() %>%
+  mutate(value = round(value,2)) %>%
+   ggplot(aes(Var2, Var1, fill = value))+
+   geom_tile(color = "white")+
+   scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                        midpoint = 0, limit = c(-1,1), space = "Lab", 
+                        name="Pearson\nCorrelation") +
+   theme_minimal()+ 
+   theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                    size = 10, hjust = 1))+
+   coord_fixed() +
+   geom_text(aes(Var2, Var1, label = value), color = "black", size = 2)
+
+
+```
+
+
+# Recipe 
+```{r}
+# deal w. categoricals 
+df_numeric <- df %>% select_if(is.numeric)
+
+loan_recipe <- recipe(~.,df) %>%
+  step_rm(id, member_id) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  prep()
+
+bake_loan <- bake(loan_recipe, df_numeric)
+
+```
+
+
+## Train your IsolationForest
+```{r}
+iso_forest <- isolationForest$new(
+  sample_size = 29777,
+  num_trees = 500,
+  max_depth = ceiling(log2(29777)))
+
+
+iso_forest$fit(bake_loan)
+```
+# predict training 
+
+evaluate histogram pick a value of average_depth to identify anomalies. a shorter average depth means the point is more isolated and more likely an anomaly 
+
+```{r}
+pred_train <- iso_forest$predict(bake_loan)
+
+pred_train %>%
+  ggplot(aes(average_depth)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 14.2, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Average Tree Depth")
+
+pred_train %>%
+  ggplot(aes(anomaly_score)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 0.62, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Anomaly Score Above 0.62")
+
+```
+
+
+# global level interpretation 
+
+The steps of interpreting anomalies on a global level are:
+
+1. Create a data frame with a column that indicates whether the record was considered an anomaly.
+2. Train a decision tree to predict the anomaly flag.
+3. Visualize the decision tree to determine which segments of the data are considered anomalous.
+
+```{r}
+train_pred <- bind_cols(iso_forest$predict(bake_loan),bake_loan) %>%
+  mutate(anomaly = as.factor(if_else(average_depth <= 14.2, "Anomaly","Normal")))
+
+train_pred %>%
+  arrange(average_depth) %>%
+  count(anomaly)
+
+```
+
+## Fit a Tree 
+```{r}
+fmla <- as.formula(paste("anomaly ~ ", paste(bake_loan %>% colnames(), collapse= "+")))
+
+outlier_tree <- decision_tree(min_n=2, tree_depth=3, cost_complexity = .01) %>%
+  set_mode("classification") %>%
+  set_engine("rpart") %>%
+  fit(fmla, data=train_pred)
+
+outlier_tree$fit
+```
+# Global Anomaly Rules 
+
+```{r}
+anomaly_rules <- rpart.rules(outlier_tree$fit,roundint=FALSE, extra = 4, cover = TRUE, clip.facs = TRUE) %>% clean_names() %>%
+  #filter(anomaly=="Anomaly") %>%
+  mutate(rule = "IF") 
+
+
+rule_cols <- anomaly_rules %>% select(starts_with("x_")) %>% colnames()
+
+for (col in rule_cols){
+anomaly_rules <- anomaly_rules %>%
+    mutate(rule = paste(rule, !!as.name(col)))
+}
+
+anomaly_rules %>%
+  as.data.frame() %>%
+  filter(anomaly == "Anomaly") %>%
+  mutate(rule = paste(rule, " THEN ", anomaly )) %>%
+  mutate(rule = paste(rule," coverage ", cover)) %>%
+  select( rule)
+
+anomaly_rules %>%
+  as.data.frame() %>%
+  filter(anomaly == "Normal") %>%
+  mutate(rule = paste(rule, " THEN ", anomaly )) %>%
+  mutate(rule = paste(rule," coverage ", cover)) %>%
+  select( rule)
+```
+
+```{r}
+
+pred_train <- bind_cols(iso_forest$predict(bake_loan),
+                        bake_loan)
+
+
+pred_train %>%
+  arrange(desc(anomaly_score) ) %>%
+  filter(average_depth <= 14.2) -> anomaly_result
+
+anomaly_result
+```
+
+## Local Anomaly Rles 
+```{r}
+
+fmla <- as.formula(paste("anomaly ~ ", paste(bake_loan %>% colnames(), collapse= "+")))
+
+pred_train %>%
+  mutate(anomaly= as.factor(if_else(id==29762, "Anomaly", "Normal"))) -> local_df
+
+local_tree <-  decision_tree(mode="classification",
+                            tree_depth = 5,
+                            min_n = 1,
+                            cost_complexity=0) %>%
+              set_engine("rpart") %>%
+                  fit(fmla,local_df )
+
+local_tree$fit
+
+rpart.rules(local_tree$fit, extra = 4, cover = TRUE, clip.facs = TRUE, roundint=FALSE)
+rpart.plot(local_tree$fit, roundint=FALSE, extra=3)
+
+anomaly_rules <- rpart.rules(local_tree$fit, extra = 4, cover = TRUE, clip.facs = TRUE) %>% clean_names() %>%
+  filter(anomaly=="Anomaly") %>%
+  mutate(rule = "IF") 
+
+
+rule_cols <- anomaly_rules %>% select(starts_with("x_")) %>% colnames()
+
+for (col in rule_cols){
+anomaly_rules <- anomaly_rules %>%
+    mutate(rule = paste(rule, !!as.name(col)))
+}
+
+as.data.frame(anomaly_rules) %>%
+  select(rule, cover)
+
+local_df #%>%
+  #filter(age < 20) %>%
+  #filter(hourly_rate < 99) %>%
+  #summarise(n=n(),
+            #mean_hourly_rate = median(hourly_rate))
+```
+
+```{r}
+
+set.seed(123)
+
+train_test_spit<- initial_split(df, prop = 0.7)
+
+train <- training(train_test_spit)
+test  <- testing(train_test_spit)
+
+sprintf("Train PCT : %1.2f%%", nrow(train)/ nrow(df) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(test)/ nrow(df) * 100)
+
+train_cv_folds <- vfold_cv(train, v=5)
+```
+
+```{r}
+
+recipe <- recipe(loan_status ~ ., data = train) %>%
+  step_rm(id, member_id, url, title, pub_rec_bankruptcies, fico_range_low, fico_range_high,
+          next_pymnt_d, mths_since_last_delinq, mths_since_last_record, installment, funded_amnt,
+          funded_amnt_inv, zip_code, emp_title, policy_code, application_type) %>%
+  step_impute_mean(all_numeric(), -all_outcomes()) %>%
+  step_novel(all_nominal(), -all_outcomes()) %>%
+  step_unknown(all_nominal(), -all_outcomes()) %>%
+  step_other(addr_state, earliest_cr_line, threshold = 0.03) %>%
+  step_tokenize(desc) %>%
+  step_stopwords(desc) %>%
+  step_ngram(desc,num_tokens = 2, min_num_tokens = 1) %>%
+  step_tokenfilter(desc,max_tokens = 100, min_times = 10) %>%
+  step_tfidf(desc) %>%
+  #step_nzv(all_predictors()) %>%
+  step_woe(all_nominal_predictors(), outcome = vars(loan_status))
+
+
+bake <- bake(recipe %>% prep(), new_data = train)
+
+
+#skim(bake) 
+```
+
+
+```{r}
+xgb_model <- boost_tree(
+  trees = tune(), 
+  tree_depth = tune(),       
+  min_n = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_model
+
+# -- setup workflow 
+xgb_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(xgb_model) 
+
+# -- setup your tuning grid -- brute force 
+#tune_grid <- grid_regular(tree_depth(),
+                         # min_n(),
+                         ## learn_rate(),
+                          #levels = 5)
+
+# -- setup your tuning grid -- random force 
+tune_grid <- grid_random(trees(c(20,100))
+                         ,tree_depth(),
+                         min_n(),
+                          size = 5)
+print(tune_grid)
+
+# -- setup parallel process 
+all_cores <- detectCores(logical = TRUE)
+sprintf("# of Logical Cores: %d", all_cores)
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+
+# -- train!! K times for each parameter -- 
+xgb_tuning_results <- xgb_workflow %>% 
+  tune_grid(
+    resamples = train_cv_folds,
+    grid = tune_grid,
+    control = control_resamples(save_pred = TRUE)
+    )
+
+xgb_tuning_results
+
+```
+
+## Review Tuning Results 
+```{r}
+## -- results of tuning -- 
+xgb_tuning_results %>% 
+  collect_metrics() %>%
+  mutate_if(is.numeric, round,3) %>% 
+  pivot_wider(names_from = .metric, values_from=c(mean, std_err))
+```
+
+## results 
+selecting "best" parameters
+```{r}
+xgb_tuning_results %>%
+  show_best("roc_auc") %>%
+  print()
+
+xgb_best <- xgb_tuning_results %>%
+  select_best("roc_auc") 
+
+print(xgb_best)
+
+```
+
+```{r}
+
+xgb_model <- boost_tree(
+  trees = 84,
+  min_n = 17,
+  tree_depth = 5
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_model
+
+# -- setup workflow 
+xgb_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(xgb_model) %>%
+  fit(train)
+```
+## Variable of importance plot
+```{r}
+xgb_workflow %>%
+  extract_fit_parsnip() %>%
+  vip(20)
+```
+
+## performance Evulation
+```{r}
+options(yardstick.event_first = FALSE)
+predict(xgb_workflow , train, type="prob") %>%
+    bind_cols(predict(xgb_workflow, train, type="class")) %>%
+    bind_cols(.,train)-> scored_train_xgb 
+
+  # -- testing 
+  predict(xgb_workflow , test, type="prob") %>%
+    bind_cols(predict(xgb_workflow, test, type="class")) %>%
+    bind_cols(.,test) -> scored_test_xgb   
+
+  # -- AUC: Train and Test 
+  scored_train_xgb %>% 
+    metrics(loan_status, .pred_default, estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows(scored_test_xgb %>% 
+                 metrics(loan_status, .pred_default, estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+```
+
+# -- roc curve plot -- 
+```{r}
+scored_test_xgb %>%
+ roc_curve(loan_status, .pred_default) %>%
+  autoplot()
+
+
+scored_test_xgb %>%
+ roc_curve(loan_status, .pred_default) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  group_by(fpr) %>%
+  summarise(threshold_min = min(score_threshold),
+            threshold_max = max(score_threshold),
+            tpr = max(tpr)) %>%
+filter(fpr >= 0.01 & fpr <= 0.10)
+
+# -- calculate KS  -- 
+scored_test_xgb %>%
+ roc_curve(loan_status, .pred_default) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  mutate(diff_tprfpr = tpr - fpr) %>%
+  slice_max(diff_tprfpr,n=1, with_ties = FALSE) %>%
+  select(fpr,tpr,score_threshold,ks = diff_tprfpr)
+```
+
+
+## 2. Random Forest
+
+
+```{r}
+# -- setup model spec w. tuning 
+rf_model <- rand_forest(
+    trees  = tune(),
+    min_n = tune(),
+   ) %>% 
+      set_engine("ranger", importance = "permutation") %>% 
+      set_mode("classification")
+
+# -- setup workflow 
+rf_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(rf_model) 
+
+# -- setup your tuning grid -- random force 
+tune_grid <- grid_random(trees(c(10,50)),
+                         min_n(),
+                          size = 5)
+print(tune_grid)
+
+# -- setup parallel process 
+all_cores <- detectCores(logical = TRUE)
+sprintf("# of Logical Cores: %d", all_cores)
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+
+# -- train!! K times for each parameter -- 
+rf_tuning_results_rf <- rf_workflow %>% 
+  tune_grid(
+    resamples = train_cv_folds,
+    grid = tune_grid,
+    control = control_resamples(save_pred = TRUE)
+    )
+
+rf_tuning_results_rf
+
+```
+
+## Review Tuning Results 
+```{r}
+## -- results of tuning -- 
+rf_tuning_results_rf %>% 
+  collect_metrics() %>%
+  mutate_if(is.numeric, round,3) %>% 
+  pivot_wider(names_from = .metric, values_from=c(mean, std_err))
+```
+
+
+## results 
+selecting "best" parameters
+```{r}
+rf_tuning_results_rf %>%
+  show_best("roc_auc") %>%
+  print()
+
+rf_best_rf <- rf_tuning_results_rf %>%
+  select_best("roc_auc") 
+
+print(rf_best_rf)
+```
+
+
+```{r}
+
+rf_model <- rand_forest(trees=100,
+                        min_n=27) %>%
+  set_engine("ranger", importance = "permutation") %>%
+  set_mode("classification") 
+
+rf_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(rf_model) %>%
+  fit(train)
+```
+
+## Variable of importance plot
+```{r}
+rf_workflow %>%
+  pull_workflow_fit() %>%
+  vip(20)
+```
+
+## performance Evulation
+```{r}
+options(yardstick.event_first = FALSE)
+predict(rf_workflow , train, type="prob") %>%
+    bind_cols(predict(rf_workflow, train, type="class")) %>%
+    bind_cols(.,train)-> scored_train_rf 
+
+  # -- testing 
+  predict(rf_workflow , test, type="prob") %>%
+    bind_cols(predict(rf_workflow, test, type="class")) %>%
+    bind_cols(.,test) -> scored_test_rf   
+
+  # -- AUC: Train and Test 
+  scored_train_rf %>% 
+    metrics(loan_status, .pred_default, estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows(scored_test_rf %>% 
+                 metrics(loan_status, .pred_default, estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+```
+
+# -- roc curve plot -- 
+```{r}
+scored_test_rf %>%
+ roc_curve(loan_status, .pred_default) %>%
+  autoplot()
+
+
+scored_test_rf %>%
+ roc_curve(loan_status, .pred_default) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  group_by(fpr) %>%
+  summarise(threshold_min = min(score_threshold),
+            threshold_max = max(score_threshold),
+            tpr = max(tpr))%>%
+filter(fpr >= 0.01 & fpr <= 0.10)
+
+# -- calculate KS  -- 
+scored_test_rf %>%
+ roc_curve(loan_status, .pred_default) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  mutate(diff_tprfpr = tpr - fpr) %>%
+  slice_max(diff_tprfpr,n=1, with_ties = FALSE) %>%
+  select(fpr,tpr,score_threshold,ks = diff_tprfpr)
+```
+
+# logistic
+
+```{r}
+log_model <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm")
+  
+log_model
+
+log_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(log_model) %>%
+  fit(train)
+
+```
+
+
+## Variable of importance plot
+
+```{r}
+log_workflow %>%
+  pull_workflow_fit() %>%
+  vip(20)
+```
+
+## performance Evulation
+
+```{r}
+options(yardstick.event_first = FALSE)
+predict(log_workflow , train, type="prob") %>%
+    bind_cols(predict(log_workflow, train, type="class")) %>%
+    bind_cols(.,train)-> scored_train_log
+
+  # -- testing 
+predict(log_workflow , test, type="prob") %>%
+    bind_cols(predict(log_workflow, test, type="class")) %>%
+    bind_cols(.,test) -> scored_test_log   
+
+  # -- AUC: Train and Test 
+scored_train_log %>% 
+    metrics(loan_status, .pred_default, estimate = .pred_class) %>%
+    mutate(part="training") %>%
+    bind_rows( scored_test_log %>% 
+                 metrics(loan_status, .pred_default, estimate = .pred_class) %>%
+                 mutate(part="testing") ) %>%
+    filter(.metric %in% c('accuracy','roc_auc')) %>%
+    pivot_wider(names_from = .metric, values_from=.estimate)
+
+```
+
+# -- roc curve plot -- 
+```{r}
+scored_test_log %>%
+ roc_curve(loan_status, .pred_default) %>%
+  autoplot()
+
+
+scored_test_log %>%
+ roc_curve(loan_status, .pred_default) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  group_by(fpr) %>%
+  summarise(threshold_min = min(score_threshold),
+            threshold_max = max(score_threshold),
+            tpr = max(tpr))%>%
+filter(fpr >= 0.01 & fpr <= 0.10)
+
+# -- calculate KS  -- 
+scored_test_log %>%
+ roc_curve(loan_status, .pred_default) %>%
+  mutate(fpr = round((1 - specificity),2),
+         tpr = round(sensitivity,3),
+         score_threshold = round(.threshold,3)) %>%
+  mutate(diff_tprfpr = tpr - fpr) %>%
+  slice_max(diff_tprfpr,n=1, with_ties = FALSE) %>%
+  select(fpr,tpr,score_threshold,ks = diff_tprfpr)
+```
+
+```{r}
+library(DALEXtra)
+
+xgb_explainer <- explain_tidymodels(
+  xgb_workflow,
+  data = select(train, -loan_status),
+  y = train$loan_status ,
+  verbose = FALSE
+)
+```
+## numeric Variable Funciton
+```{r}
+pdp_plotter <- function(variable){
+  pdp_age <- model_profile(
+  xgb_explainer,
+  variables = variable
+)
+  
+pdp_plot <- as_tibble(pdp_age$agr_profiles) %>%
+  mutate(`_label_` = str_remove(`_label_`, "workflow_")) %>%
+  ggplot(aes(`_x_`, `_yhat_`, color = `_label_`)) +
+  geom_line(size = 1.2, alpha = 0.8) +
+  labs(
+    x = variable,
+     y = " Average prediction Impact ",
+    color = NULL,
+    title = "Partial Dependence Profile Plot:",
+    subtitle = variable
+  )
+print(pdp_plot)
+}
+
+numeric_vars <- colnames(train %>% select_if(is.numeric))
+
+for (var in numeric_vars){
+  pdp_plotter(var)
+}
+
+
+```
+
+## Categorical PDP 
+
+```{r}
+
+pdp_categorical <-function(variable){
+## Wheel Type
+pdp_wheel <- model_profile(
+  xgb_explainer,
+  variables = variable,
+  variable_type="categorical"
+)
+
+p1 <- as_tibble(pdp_wheel$agr_profiles) %>%
+  mutate(`_label_` = str_remove(`_label_`, "workflow_")) %>%
+  ggplot(aes(reorder(`_x_`, `_yhat_`),`_yhat_`)) +
+  geom_col() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(
+    x = variable,
+    y = " Average prediction Impact ",
+    title = "Partial Dependence Profile Plot:",
+    subtitle = variable
+  )
+print(p1)
+}
+categorical_vars <- c("term", "grade", "sub_grade", "home_ownership", "verification_status",
+                      "issue_d", "pymnt_plan", "purpose", "policy_code")
+
+for (var in categorical_vars){
+  pdp_categorical(var)
+}
+```
+
+## Make an explainer function 
+
+```{r}
+model_features <- colnames(train)
+
+xgb_explainer <- explain_tidymodels(
+    xgb_workflow,   # fitted workflow object 
+    data = train,    # original training data
+    y = train$loan_status, # predicted outcome 
+    label = "xgboost",
+    verbose = FALSE
+  )
+
+explain_prediction <- function(record){
+  record = record %>% select(all_of(model_features))
+  # run the explainer 
+  xgb_breakdown <- predict_parts(explainer = xgb_explainer, 
+                                 new_observation = record) %>% 
+    as_tibble()
+  
+  # get a prediction 
+  prediction_prob <- predict(xgb_workflow,
+          record,
+          type="prob") %>% pull()
+
+  
+  # plot the explainer 
+  p1 <- xgb_breakdown %>%
+      filter(variable != "prediction")%>%
+      mutate(
+             contribution = round(contribution,3)) %>%
+      filter(contribution != 0) %>%
+      ggplot(aes(y=reorder(variable,position),x=contribution, fill=sign)) +
+      geom_col() + 
+      geom_text(aes(label=contribution), 
+                position=position_dodge(width=0.7),
+                vjust=0.5,
+                )+
+        labs(
+          title = "DALEX explainations",
+          subtitle = paste("predicted:",as.character(round(prediction_prob,3))),
+                          x="contribution",
+                          y="features")
+  print(p1)
+  
+}
+
+any_10_records <- scored_test_xgb %>%
+ sample_n(10)
+
+top_10_tp <- scored_test_xgb %>%
+  filter(.pred_class == loan_status) %>%
+  slice_max(.pred_default,n=10)
+
+top_10_fp <- scored_test_xgb %>%
+  filter(.pred_class != loan_status) %>%
+   filter(loan_status == "current") %>%
+  slice_max(.pred_default,n=10)
+
+top_10_fn <- scored_test_xgb %>%
+  filter(.pred_class != loan_status ) %>%
+  filter(loan_status == "default") %>%
+  slice_max(.pred_default,n=10)
+
+
+
+
+# repeat for FP and FN 
+for (row in 1:nrow(top_10_tp)) {
+    s_record <- top_10_tp[row,]
+    explain_prediction(s_record)
+} 
+
+for (row in 1:nrow(top_10_fp)) {
+    s_record <- top_10_fp[row,]
+    explain_prediction(s_record)
+} 
+
+for (row in 1:nrow(top_10_fn)) {
+    s_record <- top_10_fn[row,]
+    explain_prediction(s_record)
+} 
+
+
+```
+
+
+```{r}
+top_10_tp
+top_10_fp
+top_10_fn
+
+```
+
+# performance comparison accross test data set (ROC_AUC)
+```{r}
+scored_test_log %>%
+  mutate(model = "Logistic") %>%
+  bind_rows(scored_test_rf %>%
+              mutate(model="Random Forest")) %>%
+  bind_rows(scored_test_xgb %>%
+              mutate(model="XGboost")) %>%
+  group_by(model) %>%
+  roc_curve(loan_status, .pred_default) %>%
+  autoplot()
+
+```
+## confusion matrix
+
+```{r}
+calc_metrics <- function(data_set){
+  data_set %>%
+  mutate(loan_status = as.factor(if_else(loan_status == "current",0,1))) %>%
+  conf_mat(loan_status, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") + labs(title="confusion matrix default") -> p 
+  print(p)
+  
+}
+
+scored_test_rf %>%
+   mutate(.pred_class = as.factor(if_else(.pred_default >=0.207,1,0))) -> rf
+
+
+scored_test_xgb %>%
+   mutate(.pred_class = as.factor(if_else(.pred_default >=0.207,1,0))) -> xgb
+
+scored_test_log %>%
+   mutate(.pred_class = as.factor(if_else(.pred_default >=0.005,1,0))) -> log
+
+
+calc_metrics(rf)
+calc_metrics(xgb)
+calc_metrics(log)
+```
+
+```{r}
+scored_test_log %>%
+  mutate(model = "Logistic") %>%
+  bind_rows(scored_test_rf %>%
+              mutate(model="Random Forest")) %>%
+  bind_rows(scored_test_xgb %>%
+              mutate(model="XGboost")) %>%
+  group_by(model) %>%
+  metrics(loan_status, .pred_default, estimate = .pred_class) %>%
+  pivot_wider(names_from = .metric, values_from=.estimate) %>%
+  print()
+
+```
+
+
+
+
+
+
+
+```{r}
+predict(xgb_workflow, holdout, type="prob") %>%
+  bind_cols(holdout) -> holdout_new
+
+holdout_new
+
+holdout_new %>%
+   select(id, loan_status = .pred_default) -> holdout_new_2
+
+holdout_new_2
+
+write_csv(holdout_new_2, file = "predict.csv")
+```
+
+
+
+
+
